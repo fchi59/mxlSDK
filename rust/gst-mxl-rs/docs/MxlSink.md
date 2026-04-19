@@ -13,32 +13,53 @@ The `mxlsink` plugin acts as a bridge between the GStreamer pipeline and the Med
 
 ### 1.1 Structural Overview
 
+The internal structure maps the asynchronous nature of GStreamer to the strict timing requirements of MXL.
+
 ```mermaid
 graph TD
-    A[GStreamer Upstream Pipeline] -->|GstBuffer| B(mxlsink `render()` or `video()`)
-    B --> C{Clock Synchronization}
-    C -->|Calculate MXL Index| D[MXL State & Writer]
-    D --> E[(MXL Shared Memory Ringbuffer)]
+    subgraph GStreamer Pipeline
+        A[Upstream Elements: awshmsyncsrc, videoconvert, etc.]
+    end
 
     subgraph mxlsink Plugin
-        B
-        C
-        D
+        B[GstBaseSink render vfunc]
+        C{Clock Sync & Drift Control}
+        D[Grain/Sample Memory Mapping]
     end
+
+    subgraph MXL Domain /dev/shm
+        E[(Video Ringbuffer: mxl_grain_t)]
+        F[(Audio Ringbuffer: mxl_sample_t)]
+    end
+
+    A -- "GstBuffer (Payload + PTS)" --> B
+    B -- "Buffer PTS & running_time" --> C
+    C -- "Target Index Calculation" --> D
+    D -- "open_grain() / commit()" --> E
+    D -- "open_samples() / commit()" --> F
 ```
 
-### 1.2 The Rendering Loop
+- **GStreamer Pipeline:** Pushes buffers downstream. These buffers contain a payload and a Presentation Timestamp (`PTS`), indicating when the buffer *should* be presented relative to the pipeline's start time (`0`).
+- **Clock Sync & Drift Control (e.g., `render_video.rs`):** Determines the exact MXL absolute time this buffer represents.
+- **Grain/Sample Mapping:** Interacts directly with the MXL API (`state.instance.timestamp_to_index`) to find the mathematical index in the ringbuffer.
+- **MXL Domain:** The tmpfs/RAM-backed ringbuffer where data is physically copied (`commit_buffer()` in the code) so external readers (like `mxl-info` or other network nodes) can access it immediately.
 
-When an upstream element pushes a buffer to `mxlsink`, the plugin invokes its specific rendering logic (`render_video.rs` or `render_audio.rs`). The process involves:
-1. **Time Mapping:** Converting the GStreamer buffer's Presentation Timestamp (PTS) to the corresponding absolute MXL time.
-2. **Index Resolution:** Calculating the exact grain index (or sample index) in the MXL ringbuffer based on the MXL time and the media format's rate.
-3. **Memory Access & Copy:** Requesting a lock/access to the specific grain index (`open_grain`), copying the raw media payload into the ringbuffer, and committing the change (`commit`).
+### 1.2 The Rendering Loop Implementation
+
+When an upstream element pushes a buffer to `mxlsink`, the plugin invokes its specific rendering logic located in `src/mxlsink/render_video.rs` (for video) or `src/mxlsink/render_audio.rs` (for audio). The process is fully synchronous per buffer:
+
+1. **Time Mapping:** Inside the `video()` function, the GStreamer buffer's `PTS` is read. It is added to a pre-calculated `initial_info.mxl_to_gst_offset` to translate it into an absolute MXL nanosecond timestamp (`mxl_pts`).
+2. **Index Resolution:** The code calls `state.instance.timestamp_to_index(mxl_pts.nseconds(), &video_state.grain_rate)` to mathematically convert the absolute nanosecond time into an exact ringbuffer index (e.g., grain `106475989460`).
+3. **Memory Access & Copy:** The plugin calls `commit_buffer(buffer, video_state, index)`. Inside this helper:
+   - `video_state.writer.open_grain(index)` maps the specific grain memory into the plugin's address space.
+   - A direct memory copy `copy_from_slice` transfers the raw GStreamer payload to MXL.
+   - `access.commit()` releases the lock and signals to MXL that the grain is ready for reading.
 
 ## 2. Clock Management & Synchronization
 
 The most complex and critical aspect of `mxlsink` is reconciling two fundamentally different timing systems:
-- **MXL Clock (`mxl_now`):** An absolute, monotonically increasing clock mapped to the domain (typically synchronized via PTP, representing nanoseconds since the Unix epoch).
-- **GStreamer Clock (`gst_now` & `PTS`):** A relative running time that starts at `0` when the pipeline enters the `PLAYING` state.
+- **MXL Clock (`mxl_now`):** An absolute, monotonically increasing clock mapped to the domain (typically synchronized via PTP, representing nanoseconds since the Unix epoch). This defines the "current" index (`current_index`) using `state.instance.get_current_index(...)`.
+- **GStreamer Clock (`gst_now` & `PTS`):** A relative running time that starts at `0` when the pipeline enters the `PLAYING` state. This defines the estimated index of the incoming buffer.
 
 ### 2.1 The Initial Offset (Anchoring the Clocks)
 
@@ -64,35 +85,32 @@ For the first buffer, and every subsequent buffer in the stream, the target MXL 
 let mxl_pts = current_buffer_pts + mxl_to_gst_offset;
 ```
 
-This resulting `mxl_pts` is then converted to an MXL grain index. If the pipeline operates smoothly, this calculation ensures that the media is written exactly on time, resulting in an observed MXL latency of `0` grains.
+This `mxl_pts` is passed to `timestamp_to_index`, which calculates the estimated index: `(mxl_pts * grain_rate.numerator) / grain_rate.denominator`. If the pipeline operates smoothly, this estimated `index` will exactly match the `current_index` calculated from `mxl_now`, resulting in an observed MXL latency of `0` grains.
 
 ## 3. Real-World Handling: Drift, Jitter, and Discontinuities
 
-In a live, continuous streaming environment, perfect synchronization is rarely maintained indefinitely due to hardware clock drift and network jitter. `mxlsink` implements several safety mechanisms to handle these anomalies.
+In a live, continuous streaming environment, perfect synchronization is rarely maintained indefinitely due to hardware clock drift and network jitter.
 
 ### 3.1 Preventing Negative Latency (Writing into the Future)
 
-If the upstream GStreamer pipeline is slightly faster than real-time (or experiences minor jitter causing a frame to arrive a millisecond early), the calculated index might point to a grain in the "future" compared to MXL's current index.
+If the upstream GStreamer pipeline is slightly faster than real-time (or experiences minor jitter causing a frame to arrive a millisecond early), the calculated estimated `index` might point to a grain in the "future" compared to MXL's `current_index`.
 
-To prevent writing ahead of the clock (which can cause underflows or chaotic latency readings), the plugin clamps the target index:
+To prevent writing ahead of the clock (which can cause underflows and chaotic latency readings like `18446744073709551615`), the plugin clamps the target index:
 
 ```rust
-if calculated_index > current_mxl_index {
+if index > current_index {
     // Clamp to the present moment to prevent negative latency
-    target_index = current_mxl_index;
+    index = current_index;
 }
 ```
 
-### 3.2 Hardware Clock Drift Auto-Correction
+### 3.2 Progressive Clock Drift Auto-Correction
 
-If GStreamer's local hardware clock ticks slightly slower than MXL's PTP clock, the GStreamer stream will gradually fall behind. Over hours or days, the calculated target index will slowly drift into the past, increasing the observed latency.
+If GStreamer's local hardware clock ticks slightly slower than MXL's PTP clock, the GStreamer stream will gradually fall behind. Over hours, the calculated estimated `index` will slowly drift into the past (`index < current_index`), increasing the observed latency.
 
-To combat this, `mxlsink` monitors the drift. If the calculated index falls behind the current MXL time by an unacceptable margin (e.g., more than 2 frames), it triggers an auto-correction:
+Instead of waiting for a massive delay and causing a sudden "jump" or threshold effect, `mxlsink` uses a **progressive drift correction algorithm**.
 
-1. The plugin detects the excessive delay.
-2. It completely invalidates the initial offset (`state.initial_time = None`).
-3. It forces the current frame to be written at the exact current MXL index (resetting latency to 0).
-4. On the next frame, a brand new `mxl_to_gst_offset` is calculated, perfectly resynchronizing the two clocks.
+The plugin maintains an internal clock drift accumulator. On every frame, it calculates the latency (the difference between `current_index` and `index`). A small percentage of this latency is proportionally absorbed into a cumulative drift offset. This effectively acts like a gentle rubber band, slowly pulling the GStreamer clock back into perfect alignment with MXL over multiple frames, without any visible stutter.
 
 ### 3.3 Discontinuity & Looping Handling
 

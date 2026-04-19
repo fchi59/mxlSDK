@@ -50,15 +50,19 @@ pub(crate) fn audio(
     let bytes_per_sample = (audio_state.flow_def.bit_depth / 8) as usize;
     let samples_per_buffer =
         src.len() / (audio_state.flow_def.channel_count as usize * bytes_per_sample);
-    let gst_pts = buffer.pts().ok_or(gst::FlowError::Error)?;
-    trace!("GST BUFFER PTS: {:#?}", gst_pts);
     let mxl_now = state.instance.get_time();
 
+    if buffer.flags().contains(gst::BufferFlags::DISCONT) {
+        trace!("Audio discontinuity detected! Resetting initial time offset.");
+        audio_state.initial_time = None;
+    }
+
+    let buffer_pts = buffer.pts().unwrap_or(gst_now).nseconds();
+
     let initial = audio_state.initial_time.get_or_insert(InitialTime {
-        mxl_pts_offset: mxl_now - gst_now.nseconds(),
+        mxl_pts_offset: mxl_now.saturating_sub(buffer_pts),
     });
 
-    let initial_pts_offset = initial.mxl_pts_offset;
     let sample_rate = Rational {
         numerator: audio_state.flow_def.sample_rate.numerator as i64,
         denominator: audio_state.flow_def.sample_rate.denominator as i64,
@@ -67,7 +71,17 @@ pub(crate) fn audio(
     let num_channels = audio_state.flow_def.channel_count as usize;
     let mut remaining = samples_per_buffer;
     let mut src_offset_samples = 0;
-    let mut base_pts = gst_pts.nseconds() + initial_pts_offset;
+
+    let mut base_pts = buffer_pts + initial.mxl_pts_offset;
+
+    if base_pts < mxl_now {
+        let diff_ns = mxl_now - base_pts;
+        let correction_ns = diff_ns / 20;
+        initial.mxl_pts_offset += correction_ns;
+        base_pts += correction_ns;
+    } else if base_pts > mxl_now + LATENCY_CUSHION {
+        base_pts = mxl_now + LATENCY_CUSHION;
+    }
 
     while remaining > 0 {
         let mxl_pts = base_pts;
@@ -92,17 +106,7 @@ pub(crate) fn audio(
             samples_per_buffer, mxl_pts
         );
 
-        let latency_ns = samples_to_ns(audio_state.latency, &sample_rate);
-        let mut pts = mxl_pts + latency_ns;
-        let mxl_now = state.instance.get_time();
-        if pts < mxl_now {
-            let diff_ns = mxl_now - pts;
-            let diff_samples = ns_to_samples(diff_ns, &sample_rate);
-            audio_state.latency += diff_samples;
-            trace!("AUDIO Latency increased by {:#?} samples", diff_samples);
-            let latency_ns = samples_to_ns(audio_state.latency, &sample_rate);
-            pts = mxl_pts + latency_ns + LATENCY_CUSHION;
-        }
+        let pts = mxl_pts;
         let mxl_index = state
             .instance
             .timestamp_to_index(pts, &sample_rate)

@@ -32,23 +32,31 @@ pub(crate) fn video(
     let clock = state.pipeline.clock().ok_or(gst::FlowError::Error)?;
     let gst_now = clock.time();
     let mxl_now = state.instance.get_time();
+
+    if buffer.flags().contains(gst::BufferFlags::DISCONT) {
+        trace!("Video discontinuity detected! Resetting initial time offset.");
+        video_state.initial_time = None;
+    }
+
+    let buffer_pts = buffer.pts().unwrap_or(gst_now).nseconds();
+
     let initial = video_state.initial_time.get_or_insert(InitialTime {
-        mxl_pts_offset: mxl_now - gst_now.nseconds(),
+        mxl_pts_offset: mxl_now.saturating_sub(buffer_pts),
     });
 
-    let initial_pts_offset = initial.mxl_pts_offset;
+    let mut mxl_pts = buffer_pts + initial.mxl_pts_offset;
 
-    let gst_pts = buffer.pts().ok_or(gst::FlowError::Error)?;
-    let mxl_pts = gst_pts.nseconds() + initial_pts_offset;
-    let mut pts = mxl_pts + grains_to_ns(video_state.latency, &grain_rate);
-    if pts < mxl_now {
-        let diff_ns = mxl_now - pts;
-        let diff_grains = ns_to_grains(diff_ns, &grain_rate);
-        video_state.latency += diff_grains;
-        let latency_ns = grains_to_ns(video_state.latency, &grain_rate);
-        pts = mxl_pts + latency_ns + LATENCY_CUSHION;
+    if mxl_pts < mxl_now {
+        let diff_ns = mxl_now - mxl_pts;
+        let correction_ns = diff_ns / 20;
+        initial.mxl_pts_offset += correction_ns;
+        mxl_pts += correction_ns;
+    } else if mxl_pts > mxl_now + LATENCY_CUSHION {
+        mxl_pts = mxl_now + LATENCY_CUSHION;
     }
-    trace!("VIDEO gst PTS: {:#?}", gst_pts);
+
+    let pts = mxl_pts;
+    trace!("VIDEO gst PTS: {:#?}", buffer.pts());
     trace!("VIDEO mapped PTS: {:#?}", pts);
     let mxl_index = state
         .instance
@@ -56,7 +64,7 @@ pub(crate) fn video(
         .map_err(|_| gst::FlowError::Error)?;
     trace!("VIDEO mapped mxl_index from pts: {:#?}", mxl_index);
     commit_buffer(buffer, video_state, mxl_index)?;
-    video_state.grain_index = video_state.grain_index.wrapping_add(1);
+    video_state.grain_index = mxl_index.wrapping_add(1);
 
     Ok(gst::FlowSuccess::Ok)
 }
