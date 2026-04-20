@@ -13,7 +13,8 @@ This crate implements a GStreamer plugin to allow for reading and writing MXL fl
 
 - [Overview](#overview)  
 - [Usage](#usage)  
-- [Example Pipelines](#example-pipelines)  
+- [Example Pipelines](#example-pipelines)
+- [Internals & Architecture](#internals--architecture)
 
 ---
 
@@ -26,6 +27,8 @@ The following elements are included:
 
 - **mxlsrc**:
     - Reads MXL grains out of an MXL flow and outputs GStreamer buffers.
+
+For detailed information about the internal architecture and the clock synchronization mechanism in `mxlsink`, please refer to the [MXL Sink Internals Documentation](docs/MxlSink.md).
 
 ---
 
